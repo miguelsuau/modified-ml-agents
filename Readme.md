@@ -6,8 +6,8 @@ More information, including demonstrations of how these algorithms work, can be 
 
 ## Additional Features
 
-### Tabular Q learning
+### [Tabular Q learning](\python\QL.ipynb)
 
-### Deep Q Network
+### [Tabular Q learning](\python\DQN.ipynb)
 
 ### Multi-Agent Deep Q Network
