@@ -1,6 +1,6 @@
 # Modified ML-Agents
 
-This repository is a copy of Unity ML-Agents that includes alternative RL algorithms to PPO and code to generate plots.
+This repository is includes a collection of RL algorithms to train intelligent agents in Unity.
 
 More information, including demonstrations of how these algorithms work, can be found here [Master's Thesis Draft [pdf]](MastersThesisDraft.pdf) 
 
@@ -10,4 +10,6 @@ More information, including demonstrations of how these algorithms work, can be 
 
 ### [Deep Q Network](python/DQN.ipynb)
 
-### Multi-Agent Deep Q Network
+### [Multi-Agent Deep Q Network](python/madqn)
+
+### [Multi-Agent PPO](python/mappo)
