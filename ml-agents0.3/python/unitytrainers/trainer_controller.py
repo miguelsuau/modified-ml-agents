@@ -12,6 +12,9 @@ import yaml
 from tensorflow.python.tools import freeze_graph
 from unitytrainers.ppo.trainer import PPOTrainer
 from unitytrainers.dqn.DQNtrainer import DQNTrainer
+from unitytrainers.madqn.trainer import MADQNTrainer
+from unitytrainers.mappo.trainer import MAPPOTrainer
+from unitytrainers.coma.trainer import COMATrainer
 from unitytrainers.bc.trainer import BehavioralCloningTrainer
 from unityagents import UnityEnvironment, UnityEnvironmentException
 
@@ -146,7 +149,7 @@ class TrainerController(object):
                                   restore_op_name="save/restore_all", filename_tensor_name="save/Const:0")
 
     def _initialize_trainers(self, trainer_config, sess):
-        trainer_parameters_dict = {}
+        self.trainer_parameters_dict = {}
         self.trainers = {}
         for brain_name in self.env.external_brain_names:
             trainer_parameters = trainer_config['default'].copy()
@@ -167,21 +170,31 @@ class TrainerController(object):
                     _brain_key = trainer_config[_brain_key]
                 for k in trainer_config[_brain_key]:
                     trainer_parameters[k] = trainer_config[_brain_key][k]
-            trainer_parameters_dict[brain_name] = trainer_parameters.copy()
+            self.trainer_parameters_dict[brain_name] = trainer_parameters.copy()
         for brain_name in self.env.external_brain_names:
-            if trainer_parameters_dict[brain_name]['trainer'] == "imitation":
+            if self.trainer_parameters_dict[brain_name]['trainer'] == "imitation":
                 self.trainers[brain_name] = BehavioralCloningTrainer(sess, self.env, brain_name,
-                                                                     trainer_parameters_dict[brain_name],
+                                                                     self.trainer_parameters_dict[brain_name],
                                                                      self.train_model, self.seed)
-            elif trainer_parameters_dict[brain_name]['trainer'] == "ppo":
-                self.trainers[brain_name] = PPOTrainer(sess, self.env, brain_name, trainer_parameters_dict[brain_name],
+            elif self.trainer_parameters_dict[brain_name]['trainer'] == "ppo":
+                self.trainers[brain_name] = PPOTrainer(sess, self.env, brain_name, self.trainer_parameters_dict[brain_name],
                                                        self.train_model, self.seed)
-            elif trainer_parameters_dict[brain_name]['trainer'] == "dqn":
-                self.trainers[brain_name] = DQNTrainer(sess, self.env, brain_name, trainer_parameters_dict[brain_name],
+            elif self.trainer_parameters_dict[brain_name]['trainer'] == "dqn":
+                self.trainers[brain_name] = DQNTrainer(sess, self.env, brain_name, self.trainer_parameters_dict[brain_name],
+                                                       self.train_model, self.seed)
+            elif self.trainer_parameters_dict[brain_name]['trainer'] == "madqn":
+                self.trainers[brain_name] = MADQNTrainer(sess, self.env, brain_name, self.trainer_parameters_dict[brain_name],
+                                                       self.train_model, self.seed)
+            elif self.trainer_parameters_dict[brain_name]['trainer'] == "mappo":
+                self.trainers[brain_name] = MAPPOTrainer(sess, self.env, brain_name, self.trainer_parameters_dict[brain_name],
+                                                       self.train_model, self.seed)
+            elif self.trainer_parameters_dict[brain_name]['trainer'] == "coma":
+                self.trainers[brain_name] = COMATrainer(sess, self.env, brain_name, self.trainer_parameters_dict[brain_name],
                                                        self.train_model, self.seed)
             else:
                 raise UnityEnvironmentException("The trainer config contains an unknown trainer type for brain {}"
                                                 .format(brain_name))
+
         all_vars = tf.trainable_variables()
         self.brain_vars = {}
         total_vars = len(all_vars)
@@ -191,7 +204,16 @@ class TrainerController(object):
             self.brain_vars[brain_name] = all_vars[idx1:idx2]
             idx1 = idx2
             idx2 = idx2*total_vars
-            self.trainers[brain_name].update_target_graph(self.brain_vars[brain_name])
+            if (self.trainer_parameters_dict[brain_name]['trainer'] == "dqn" or
+            self.trainer_parameters_dict[brain_name]['trainer'] == "madqn"):
+                self.trainers[brain_name].update_target_graph(self.brain_vars[brain_name])
+                if self.trainer_parameters_dict[brain_name]['trainer'] == "madqn":
+                    if not self.trainers[brain_name].parameters['frozen']:
+                        self.free_brain_vars = self.brain_vars[brain_name]
+        for brain_name in self.env.external_brain_names:
+            if self.trainer_parameters_dict[brain_name]['trainer'] == "madqn":
+                if self.trainers[brain_name].parameters['frozen']:
+                    self.trainers[brain_name].update_frozen_brain_graph(self.brain_vars[brain_name], self.free_brain_vars)
 
     def _load_config(self):
         try:
@@ -248,12 +270,13 @@ class TrainerController(object):
             try:
                 while any([t.get_step <= t.get_max_steps for k, t in self.trainers.items()]) or not self.train_model:
                     if self.env.global_done:
-                        self.env.curriculum.increment_lesson(self._get_progress())
+                        #self.env.curriculum.increment_lesson(self._get_progress())
                         curr_info = self.env.reset(train_mode=self.fast_simulation)
                         for brain_name, trainer in self.trainers.items():
                             trainer.end_episode()
                     # Decide and take an action
                     take_action_vector, take_action_memories, take_action_text, take_action_outputs = {}, {}, {}, {}
+
                     for brain_name, trainer in self.trainers.items():
                         (take_action_vector[brain_name],
                          take_action_memories[brain_name],
@@ -262,22 +285,31 @@ class TrainerController(object):
                     new_info = self.env.step(vector_action=take_action_vector, memory=take_action_memories,
                                              text_action=take_action_text)
                     for brain_name, trainer in self.trainers.items():
-                        trainer.add_experiences(curr_info, new_info, take_action_outputs[brain_name])
+                        if self.trainer_parameters_dict[brain_name]['trainer'] == "mappo":
+                            trainer.add_experiences(curr_info, new_info, take_action_outputs[brain_name], take_action_vector)
+                        else:
+                            trainer.add_experiences(curr_info, new_info, take_action_outputs[brain_name])
                     curr_info = new_info
                     for brain_name, trainer in self.trainers.items():
-                        trainer.process_experiences(curr_info)
-                        if trainer.is_ready_update() and self.train_model and trainer.get_step <= trainer.get_max_steps:
+                        if self.trainer_parameters_dict[brain_name]['trainer'] == "mappo":
+                            take_action_vector[brain_name] = trainer.simulate_action(curr_info)
+                    for brain_name, trainer in self.trainers.items():
+                        if self.trainer_parameters_dict[brain_name]['trainer'] == "mappo":
+                            trainer.process_experiences(curr_info, take_action_vector)
+                        else:
+                            trainer.process_experiences(curr_info)
+                        step = trainer.get_step
+                        max_steps = trainer.get_max_steps
+                        if trainer.is_ready_update() and self.train_model and step <= max_steps:
                             # Perform gradient descent with experience buffer
-                            #print("update")
                             trainer.update_model()
                         # Write training statistics to tensorboard.
                         trainer.write_summary(self.env.curriculum.lesson_number)
-                        if self.train_model and trainer.get_step <= trainer.get_max_steps:
+                        if self.train_model and step <= max_steps:
                             trainer.increment_step()
                             trainer.update_last_reward()
-                    if self.train_model and trainer.get_step <= trainer.get_max_steps:
+                    if self.train_model and step <= max_steps:
                         global_step += 1
-                        #print("global step " + str(global_step))
                     if global_step % self.save_freq == 0 and global_step != 0 and self.train_model:
                         # Save Tensorflow model
                         self._save_model(sess, steps=global_step, saver=saver)

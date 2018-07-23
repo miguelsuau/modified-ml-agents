@@ -80,6 +80,25 @@ class LearningModel(object):
                                      kernel_initializer=c_layers.variance_scaling_initializer(1.0))
         return hidden
 
+    def create_continuous_state_action_encoder(self, h_size, activation, num_layers):
+        """
+        Builds a set of hidden state encoders.
+        :param h_size: Hidden layer size.
+        :param activation: What type of activation function to use for layers.
+        :param num_layers: number of hidden layers to create.
+        :return: List of hidden layer tensors.
+        """
+        # Actions taken by other agents
+        self.other_actions = tf.placeholder(shape=[None, self.n_brain - 1], dtype=tf.int64, name='other_actions')
+        self.other_actions_one_hot = c_layers.one_hot_encoding(self.other_actions, self.a_size)
+        self.other_actions_one_hot = tf.reshape(self.other_actions_one_hot, [-1,self.a_size*(self.n_brain - 1)])
+        self.other_actions_one_hot = tf.cast(self.other_actions_one_hot, tf.float32)
+        hidden = tf.concat([self.normalized_state, self.other_actions_one_hot], axis=1)
+        for j in range(num_layers):
+            hidden = tf.layers.dense(hidden, h_size, activation=activation,
+                                     kernel_initializer=c_layers.variance_scaling_initializer(1.0))
+        return hidden
+
     def create_visual_encoder(self, h_size, activation, num_layers):
         """
         Builds a set of visual (CNN) encoders.
@@ -158,6 +177,50 @@ class LearningModel(object):
             final_hiddens.append(final_hidden)
         return final_hiddens
 
+    def create_new_action_obs(self, num_streams, h_size, num_layers, trainer):
+        brain = self.brain
+        s_size = brain.vector_observation_space_size * brain.num_stacked_vector_observations
+        if brain.vector_action_space_type == "continuous":
+            activation_fn = tf.nn.tanh
+        else:
+            activation_fn = self.swish
+
+        self.visual_in = []
+        for i in range(brain.number_visual_observations):
+            height_size, width_size = brain.camera_resolutions[i]['height'], brain.camera_resolutions[i]['width']
+            bw = brain.camera_resolutions[i]['blackAndWhite']
+            visual_input = self.create_visual_input(height_size, width_size, bw, name="visual_observation_" + str(i))
+            self.visual_in.append(visual_input)
+        #self.create_vector_input(s_size)
+
+        final_hiddens = []
+        for i in range(num_streams):
+            visual_encoders = []
+            hidden_state, hidden_visual = None, None
+            if brain.number_visual_observations > 0:
+                for j in range(brain.number_visual_observations):
+                    encoded_visual = self.create_visual_encoder(h_size, activation_fn, num_layers)
+                    visual_encoders.append(encoded_visual)
+                hidden_visual = tf.concat(visual_encoders, axis=1)
+            if brain.vector_observation_space_size > 0:
+                s_size = brain.vector_observation_space_size * brain.num_stacked_vector_observations
+                if brain.vector_observation_space_type == "continuous":
+                    hidden_state_action = self.create_continuous_state_action_encoder(h_size, activation_fn, num_layers)
+                else:
+                    hidden_state = self.create_discrete_state_encoder(s_size, h_size,
+                                                                      activation_fn, num_layers)
+            if hidden_state is not None and hidden_visual is not None:
+                final_hidden = tf.concat([hidden_visual, hidden_state], axis=1)
+            elif hidden_state is None and hidden_visual is not None:
+                final_hidden = hidden_visual
+            elif hidden_state_action is not None and hidden_visual is None:
+                final_hidden = hidden_state_action
+            else:
+                raise Exception("No valid network configuration possible. "
+                                "There are no states or observations in this brain")
+            final_hiddens.append(final_hidden)
+        return final_hiddens
+
     def create_recurrent_encoder(self, input_state, memory_in, name='lstm'):
         """
         Builds a recurrent encoder for either state or observations (LSTM).
@@ -203,6 +266,96 @@ class LearningModel(object):
         self.output = tf.identity(self.output, name="action")
 
         self.value = tf.layers.dense(hidden, 1, activation=None)
+        self.value = tf.identity(self.value, name="value_estimate")
+        self.entropy = -tf.reduce_sum(self.all_probs * tf.log(self.all_probs + 1e-10), axis=1)
+        self.action_holder = tf.placeholder(shape=[None], dtype=tf.int32)
+        self.selected_actions = c_layers.one_hot_encoding(self.action_holder, self.a_size)
+
+        self.all_old_probs = tf.placeholder(shape=[None, self.a_size], dtype=tf.float32, name='old_probabilities')
+
+        # We reshape these tensors to [batch x 1] in order to be of the same rank as continuous control probabilities.
+        self.probs = tf.expand_dims(tf.reduce_sum(self.all_probs * self.selected_actions, axis=1), 1)
+        self.old_probs = tf.expand_dims(tf.reduce_sum(self.all_old_probs * self.selected_actions, axis=1), 1)
+
+    def create_dc_ma_actor_critic(self, h_size, num_layers, n_brain, trainer):
+        num_streams = 1
+        self.n_brain = n_brain
+        hidden_streams1 = self.create_new_obs(num_streams, h_size, num_layers)
+        hidden1 = hidden_streams1[0]
+        # hidden_streams2 = self.create_new_action_obs(num_streams, h_size, num_layers, trainer)
+        # hidden2 = hidden_streams2[0]
+
+        if self.use_recurrent:
+            tf.Variable(self.m_size, name="memory_size", trainable=False, dtype=tf.int32)
+            self.prev_action = tf.placeholder(shape=[None], dtype=tf.int32, name='prev_action')
+            self.prev_action_oh = c_layers.one_hot_encoding(self.prev_action, self.a_size)
+            hidden = tf.concat([hidden, self.prev_action_oh], axis=1)
+
+            self.memory_in = tf.placeholder(shape=[None, self.m_size], dtype=tf.float32, name='recurrent_in')
+            hidden, self.memory_out = self.create_recurrent_encoder(hidden, self.memory_in)
+            self.memory_out = tf.identity(self.memory_out, name='recurrent_out')
+
+        self.policy = tf.layers.dense(hidden1, self.a_size, activation=None, use_bias=False,
+                                      kernel_initializer=c_layers.variance_scaling_initializer(factor=0.01))
+
+        #hidden2 = tf.layers.dense(hidden2, h_size, activation=self.swish)
+        self.all_probs = tf.nn.softmax(self.policy, name="action_probs")
+        self.output = tf.multinomial(self.policy, 1)
+        self.output = tf.identity(self.output, name="action")
+
+        self.other_actions = tf.placeholder(shape=[None, self.n_brain - 1], dtype=tf.int64, name='other_actions')
+        self.other_actions_one_hot = c_layers.one_hot_encoding(self.other_actions, self.a_size)
+        self.other_actions_one_hot = tf.reshape(self.other_actions_one_hot, [-1,self.a_size*(self.n_brain - 1)])
+        self.other_actions_one_hot = tf.cast(self.other_actions_one_hot, tf.float32)
+        hidden2 = tf.concat([hidden1, self.other_actions_one_hot], axis=1)
+        self.value = tf.layers.dense(hidden2, 1, activation=None)
+        self.value = tf.identity(self.value, name="value_estimate")
+
+        self.entropy = -tf.reduce_sum(self.all_probs * tf.log(self.all_probs + 1e-10), axis=1)
+        self.action_holder = tf.placeholder(shape=[None], dtype=tf.int32)
+        self.selected_actions = c_layers.one_hot_encoding(self.action_holder, self.a_size)
+
+        self.all_old_probs = tf.placeholder(shape=[None, self.a_size], dtype=tf.float32, name='old_probabilities')
+
+        # We reshape these tensors to [batch x 1] in order to be of the same rank as continuous control probabilities.
+        self.probs = tf.expand_dims(tf.reduce_sum(self.all_probs * self.selected_actions, axis=1), 1)
+        self.old_probs = tf.expand_dims(tf.reduce_sum(self.all_old_probs * self.selected_actions, axis=1), 1)
+
+    def create_dc_coma_actor_critic(self, h_size, num_layers, n_brain, trainer):
+        num_streams = 1
+        self.n_brain = n_brain
+        hidden_streams1 = self.create_new_obs(num_streams, h_size, num_layers)
+        hidden1 = hidden_streams1[0]
+        # hidden_streams2 = self.create_new_action_obs(num_streams, h_size, num_layers, trainer)
+        # hidden2 = hidden_streams2[0]
+
+        if self.use_recurrent:
+            tf.Variable(self.m_size, name="memory_size", trainable=False, dtype=tf.int32)
+            self.prev_action = tf.placeholder(shape=[None], dtype=tf.int32, name='prev_action')
+            self.prev_action_oh = c_layers.one_hot_encoding(self.prev_action, self.a_size)
+            hidden = tf.concat([hidden, self.prev_action_oh], axis=1)
+
+            self.memory_in = tf.placeholder(shape=[None, self.m_size], dtype=tf.float32, name='recurrent_in')
+            hidden, self.memory_out = self.create_recurrent_encoder(hidden, self.memory_in)
+            self.memory_out = tf.identity(self.memory_out, name='recurrent_out')
+
+        self.policy = tf.layers.dense(hidden1, self.a_size, activation=None, use_bias=False,
+                                      kernel_initializer=c_layers.variance_scaling_initializer(factor=0.01))
+
+        self.all_probs = tf.nn.softmax(self.policy, name="action_probs")
+        self.output = tf.multinomial(self.policy, 1)
+        self.output = tf.identity(self.output, name="action")
+
+        #self.other_actions = tf.placeholder(shape=[None, self.n_brain - 1], dtype=tf.int64, name='other_actions')
+        self.agent_action = tf.placeholder(shape=[None, 1], dtype=tf.int64, name="agent_action")
+        self.agent_action_one_hot = tf.one_hot(self.agent_action, self.a_size, dtype=tf.float32)
+        self.other_actions = tf.placeholder(shape=[None, self.n_brain - 1], dtype=tf.int64, name='other_actions')
+        self.other_actions_one_hot = c_layers.one_hot_encoding(self.other_actions, self.a_size)
+        self.other_actions_one_hot = tf.reshape(self.other_actions_one_hot, [-1,self.a_size*(self.n_brain - 1)])
+        self.other_actions_one_hot = tf.cast(self.other_actions_one_hot, tf.float32)
+        hidden2 = tf.concat([hidden1, self.other_actions_one_hot], axis=1)
+        self.values = tf.layers.dense(hidden2, self.a_size, activation=None)
+        self.value = tf.reduce_sum(tf.multiply(self.values, tf.reshape(self.agent_action_one_hot,[-1, self.a_size])), axis=1)
         self.value = tf.identity(self.value, name="value_estimate")
         self.entropy = -tf.reduce_sum(self.all_probs * tf.log(self.all_probs + 1e-10), axis=1)
         self.action_holder = tf.placeholder(shape=[None], dtype=tf.int32)
@@ -280,7 +433,7 @@ class LearningModel(object):
         # Value Function predictions
         self.predictions = tf.layers.dense(hidden, self.a_size, activation=None, use_bias=True,
                                      kernel_initializer=c_layers.variance_scaling_initializer(factor=1.0))
-        self.predictions = tf.identity(self.predictions, name="predictions")
+        self.predictions = tf.identity(self.predictions, name="value_estimate")
         self.output = tf.argmax(self.predictions,1)
         self.epsilon = tf.train.polynomial_decay(epsilon_start, self.global_step,
                                                 epsilon_decay_steps, epsilon_end,
@@ -289,9 +442,10 @@ class LearningModel(object):
         # self.chosen_action = tf.cond(self.explore, lambda: self.random_action, lambda: self.output)
         self.output_onehot = tf.one_hot(self.output, self.a_size, dtype=tf.float32)
         self.prob = tf.ones([self.a_size])*self.epsilon/self.a_size + tf.multiply(self.output_onehot,tf.ones([self.a_size])*(1-self.epsilon))
-        self.random_action = tf.multinomial(tf.log(self.prob), 1)
+        self.prob = tf.identity(self.prob, name="action_probs")
+        self.chosen_action = tf.multinomial(tf.log(self.prob), 1)
         self.output = tf.reshape(self.output,[tf.shape(self.vector_in)[0],1])
-        self.output = tf.identity(self.output, name="action")
+        self.output = tf.identity(self.output, name='action')
 
         # Value Function update
         self.targets = tf.placeholder(shape=[None], dtype=tf.float32, name="targets")
@@ -300,3 +454,81 @@ class LearningModel(object):
 
         self.actions_onehot = tf.one_hot(self.actions, self.a_size, dtype=tf.float32)
         self.action_value = tf.reduce_sum(tf.multiply(self.predictions, self.actions_onehot), axis=1)
+
+    def create_madqn_model(self, h_size, num_layers, epsilon_start, epsilon_end, epsilon_decay_steps, frozen, update_frozen_freq):
+        """
+        Creates Discrete Control Q learning model.
+        :param brain: State-space size
+        :param h_size: Hidden layer size
+        :param max_step: Total number of training steps
+        :param normalize: Normalize observations
+        :num_layers: Number of hidden layers in the value function approximator
+        """
+        if not frozen: # Non-frozen brains are continously being updated
+            num_streams = 1
+            hidden_streams = self.create_new_obs(num_streams, h_size, num_layers)
+            hidden = hidden_streams[0]
+            if self.use_recurrent:
+                tf.Variable(self.m_size, name="memory_size", trainable=False, dtype=tf.int32)
+                self.prev_action = tf.placeholder(shape=[None], dtype=tf.int32, name='prev_action')
+                self.prev_action_oh = c_layers.one_hot_encoding(self.prev_action, self.a_size)
+                hidden = tf.concat([hidden, self.prev_action_oh], axis=1)
+
+                self.memory_in = tf.placeholder(shape=[None, self.m_size], dtype=tf.float32, name='recurrent_in')
+                hidden, self.memory_out = self.create_recurrent_encoder(hidden, self.memory_in)
+                self.memory_out = tf.identity(self.memory_out, name='recurrent_out')
+
+            # Value Function predictions
+            self.predictions = tf.layers.dense(hidden, self.a_size, activation=None, use_bias=True,
+                                         kernel_initializer=c_layers.variance_scaling_initializer(factor=1.0))
+            self.predictions = tf.identity(self.predictions, name="value_estimate")
+            self.output = tf.argmax(self.predictions,1)
+
+            # Epsilon decay is restarted every time the frozen policy is updated
+            #self.step =  self.global_step - self.n_updates*update_frozen_freq
+            self.epsilon = tf.train.polynomial_decay(epsilon_start, self.global_step,
+                                                    epsilon_decay_steps, epsilon_end,
+                                                    power=1.0)
+
+            self.output_onehot = tf.one_hot(self.output, self.a_size, dtype=tf.float32)
+            self.prob = tf.ones([self.a_size])*self.epsilon/self.a_size + tf.multiply(self.output_onehot,tf.ones([self.a_size])*(1-self.epsilon))
+            self.prob = tf.identity(self.prob, name="action_probs")
+            self.chosen_action = tf.multinomial(tf.log(self.prob), 1)
+            self.output = tf.reshape(self.output,[tf.shape(self.vector_in)[0],1])
+            self.output = tf.identity(self.output, name="action")
+
+            # Value Function update
+            self.targets = tf.placeholder(shape=[None], dtype=tf.float32, name="targets")
+            self.actions = tf.placeholder(shape=[None], dtype=tf.int32, name="actions")
+
+
+            self.actions_onehot = tf.one_hot(self.actions, self.a_size, dtype=tf.float32)
+            self.action_value = tf.reduce_sum(tf.multiply(self.predictions, self.actions_onehot), axis=1)
+
+        else: # Frozen brains are only updated periodically
+            num_streams = 1
+            hidden_streams = self.create_new_obs(num_streams, h_size, num_layers)
+            hidden = hidden_streams[0]
+            if self.use_recurrent:
+                tf.Variable(self.m_size, name="memory_size", trainable=False, dtype=tf.int32)
+                self.prev_action = tf.placeholder(shape=[None], dtype=tf.int32, name='prev_action')
+                self.prev_action_oh = c_layers.one_hot_encoding(self.prev_action, self.a_size)
+                hidden = tf.concat([hidden, self.prev_action_oh], axis=1)
+
+                self.memory_in = tf.placeholder(shape=[None, self.m_size], dtype=tf.float32, name='recurrent_in')
+                hidden, self.memory_out = self.create_recurrent_encoder(hidden, self.memory_in)
+                self.memory_out = tf.identity(self.memory_out, name='recurrent_out')
+            # Value Function predictions
+            self.predictions = tf.layers.dense(hidden, self.a_size, activation=None, use_bias=True,
+                                         kernel_initializer=c_layers.variance_scaling_initializer(factor=1.0))
+            self.predictions = tf.identity(self.predictions, name="value_estimate")
+            self.output = tf.argmax(self.predictions,1)
+            self.output_onehot = tf.one_hot(self.output, self.a_size, dtype=tf.float32)
+            self.epsilon = tf.train.polynomial_decay(epsilon_start, self.global_step,
+                                                    epsilon_decay_steps, epsilon_end,
+                                                    power=1.0)
+            self.prob = tf.ones([self.a_size])*self.epsilon/self.a_size + tf.multiply(self.output_onehot,tf.ones([self.a_size])*(1-self.epsilon))
+            self.prob = tf.identity(self.prob, name="action_probs")
+            self.chosen_action = tf.multinomial(tf.log(self.prob), 1)
+            self.output = tf.reshape(self.output,[tf.shape(self.vector_in)[0],1])
+            self.output = tf.identity(self.output, name="action")

@@ -6,9 +6,9 @@ from unitytrainers.models import LearningModel
 logger = logging.getLogger("unityagents")
 
 
-class PPOModel(LearningModel):
+class COMAModel(LearningModel):
     def __init__(self, brain, lr=1e-4, h_size=128, epsilon=0.2, beta=1e-3, max_step=5e6,
-                 normalize=False, use_recurrent=False, num_layers=2, m_size=None):
+                 normalize=False, use_recurrent=False, num_layers=2, m_size=None, n_agents=None):
         """
         Takes a Unity environment and model-specific hyper-parameters and returns the
         appropriate PPO agent model for the environment.
@@ -32,9 +32,9 @@ class PPOModel(LearningModel):
             self.create_cc_actor_critic(h_size, num_layers)
             self.entropy = tf.ones_like(tf.reshape(self.value, [-1])) * self.entropy
         else:
-            self.create_dc_actor_critic(h_size, num_layers)
-        self.create_ppo_optimizer(self.probs, self.old_probs, self.value,
-                                  self.entropy, beta, epsilon, lr, max_step)
+            self.create_dc_coma_actor_critic(h_size, num_layers, n_agents, 'coma')
+        self.create_coma_optimizer(self.probs, self.old_probs, self.value,
+                                    self.entropy, beta, epsilon, lr, max_step)
 
     @staticmethod
     def create_reward_encoder():
@@ -44,7 +44,7 @@ class PPOModel(LearningModel):
         update_reward = tf.assign(last_reward, new_reward)
         return last_reward, new_reward, update_reward
 
-    def create_ppo_optimizer(self, probs, old_probs, value, entropy, beta, epsilon, lr, max_step):
+    def create_coma_optimizer(self, probs, old_probs, value, entropy, beta, epsilon, lr, max_step):
         """
         Creates training-specific Tensorflow ops for PPO models.
         :param probs: Current policy probabilities
@@ -70,12 +70,13 @@ class PPOModel(LearningModel):
 
         self.mask = tf.equal(self.mask_input, 1.0)
 
-        clipped_value_estimate = self.old_value + tf.clip_by_value(tf.reduce_sum(value, axis=1) - self.old_value,
+        clipped_value_estimate = self.old_value + tf.clip_by_value(value - self.old_value,
                                                                    - decay_epsilon, decay_epsilon)
-        v_opt_a = tf.squared_difference(self.returns_holder, tf.reduce_sum(value, axis=1))
+        self.value1 = tf.squared_difference(self.returns_holder, value)                                                   
+        v_opt_a = tf.squared_difference(self.returns_holder, value)
         v_opt_b = tf.squared_difference(self.returns_holder, clipped_value_estimate)
         self.value_loss = tf.reduce_mean(tf.boolean_mask(tf.maximum(v_opt_a, v_opt_b), self.mask))
-
+        #self.update_value = optimizer.minimize(self.value_loss)
         # Here we calculate PPO policy loss. In continuous control this is done independently for each action gaussian
         # and then averaged together. This provides significantly better performance than treating the probability
         # as an average of probabilities, or as a joint probability.
@@ -84,6 +85,6 @@ class PPOModel(LearningModel):
         self.p_opt_b = tf.clip_by_value(self.r_theta, 1.0 - decay_epsilon, 1.0 + decay_epsilon) * self.advantage
         self.policy_loss = -tf.reduce_mean(tf.boolean_mask(tf.minimum(self.p_opt_a, self.p_opt_b), self.mask))
 
-        self.loss = self.policy_loss + 0.5 * self.value_loss - decay_beta * tf.reduce_mean(
+        self.loss = self.policy_loss + 0.5*self.value_loss - decay_beta * tf.reduce_mean(
             tf.boolean_mask(entropy, self.mask))
         self.update_batch = optimizer.minimize(self.loss)

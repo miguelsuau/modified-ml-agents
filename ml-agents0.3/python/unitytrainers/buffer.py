@@ -215,23 +215,26 @@ class Buffer(dict):
             self.update_buffer[field_key].extend(
                 self[agent_id][field_key].get_batch(batch_size=batch_size, training_length=training_length)
             )
-    def append_replay_memory(self, agent_id, key_list=None, replay_memory_size=None):
+
+    def append_replay_memory(self, local_buffer, key_list=None, replay_memory_size=None):
         """
         Appends the buffer of an agent to the update buffer.
         :param agent_id: The id of the agent which data will be appended
         :param key_list: The fields that must be added. If None: all fields will be appended.
         """
         if key_list is None:
-            key_list = self[agent_id].keys()
-        if not self[agent_id].check_length(key_list):
-            raise BufferException("The length of the fields {0} for agent {1} where not of same length"
-                                  .format(key_list, agent_id))
+            key_list = local_buffer.keys()
         if len(self.update_buffer['actions']) >= int(replay_memory_size):
-            n = len(self[agent_id]['actions'])
+            n = len(local_buffer['actions'])
             self.delete_entries_update_buffer(n)
         for field_key in key_list:
             self.update_buffer[field_key].extend(
-                self[agent_id][field_key])
+                local_buffer[field_key])
+
+    def reset_replay_memory(self):
+        key_list = self.update_buffer.keys()
+        for field_key in key_list:
+            self.update_buffer[field_key] = []
 
     def append_all_agent_batch_to_update_buffer(self, key_list=None, batch_size=None, training_length=None):
         """

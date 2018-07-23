@@ -11,13 +11,15 @@ import tensorflow as tf
 from unityagents import AllBrainInfo
 from unitytrainers.buffer import Buffer
 from unitytrainers.dqn.DQNmodel import DQNModel
+from unitytrainers.madqn.model import MADQNModel
 from unitytrainers.trainer import UnityTrainerException, Trainer
 
 logger = logging.getLogger("unityagents")
 
 history_keys = ['states', 'actions', 'rewards', 'next_states', 'done']
 
-class DQNTrainer(Trainer):
+
+class MADQNTrainer(Trainer):
     """The DQNTrainer is an implementation of the DQN algorithm."""
 
     def __init__(self, sess, env, brain_name, trainer_parameters, training, seed):
@@ -30,15 +32,15 @@ class DQNTrainer(Trainer):
         """
         self.param_keys = ['batch_size', 'replay_memory_size', 'epsilon_start', 'epsilon_end', 'epsilon_decay_steps',
                            'gamma', 'hidden_units', 'lambd', 'learning_rate', 'max_steps', 'tau', 'update_freq',
-                           'normalize', 'num_layers', 'time_horizon','summary_freq', 'use_recurrent',
-                           'graph_scope', 'summary_path', 'memory_size', 'pre_train_steps']
+                           'normalize', 'num_layers','summary_freq', 'use_recurrent','graph_scope', 'summary_path',
+                           'pre_train_steps', 'frozen', 'update_frozen_freq']
 
         for k in self.param_keys:
             if k not in trainer_parameters:
                 raise UnityTrainerException("The hyperparameter {0} could not be found for the DQN trainer of "
                                             "brain {1}.".format(k, brain_name))
 
-        super(DQNTrainer, self).__init__(sess, env, brain_name, trainer_parameters, training)
+        super(MADQNTrainer, self).__init__(sess, env, brain_name, trainer_parameters, training)
 
         self.use_recurrent = trainer_parameters["use_recurrent"]
         self.sequence_length = 1
@@ -57,7 +59,7 @@ class DQNTrainer(Trainer):
         self.variable_scope = trainer_parameters['graph_scope']
         with tf.variable_scope(self.variable_scope):
             tf.set_random_seed(seed)
-            self.main = DQNModel(env.brains[brain_name],
+            self.main = MADQNModel(env.brains[brain_name],
                                   lr=float(trainer_parameters['learning_rate']),
                                   h_size=int(trainer_parameters['hidden_units']),
                                   epsilon_start=float(trainer_parameters['epsilon_start']),
@@ -68,8 +70,10 @@ class DQNTrainer(Trainer):
                                   normalize=trainer_parameters['normalize'],
                                   use_recurrent=trainer_parameters['use_recurrent'],
                                   num_layers=int(trainer_parameters['num_layers']),
-                                  m_size=self.m_size)
-            self.target = DQNModel(env.brains[brain_name],
+                                  m_size=self.m_size,
+                                  frozen=trainer_parameters['frozen'],
+                                  update_frozen_freq=trainer_parameters['update_frozen_freq'])
+            self.target = MADQNModel(env.brains[brain_name],
                                   lr=float(trainer_parameters['learning_rate']),
                                   h_size=int(trainer_parameters['hidden_units']),
                                   epsilon_start=float(trainer_parameters['epsilon_start']),
@@ -80,16 +84,18 @@ class DQNTrainer(Trainer):
                                   normalize=trainer_parameters['normalize'],
                                   use_recurrent=trainer_parameters['use_recurrent'],
                                   num_layers=int(trainer_parameters['num_layers']),
-                                  m_size=self.m_size)
+                                  m_size=self.m_size,
+                                  frozen=trainer_parameters['frozen'],
+                                  update_frozen_freq=trainer_parameters['update_frozen_freq'])
 
 
         stats = {'cumulative_reward': [], 'episode_length': [], 'value_estimate': [],
                  'learning_rate': [], 'epsilon': []}
         self.stats = stats
+
         self.training_buffer = Buffer()
         self.cumulative_rewards = {}
         self.episode_steps = {}
-        self.episode = {}
         self.is_continuous = (env.brains[brain_name].vector_action_space_type == "continuous")
         self.use_observations = (env.brains[brain_name].number_visual_observations > 0)
         self.use_states = (env.brains[brain_name].vector_observation_space_size > 0)
@@ -177,12 +183,14 @@ class DQNTrainer(Trainer):
         :return: a tuple containing action, memories, values and an object
         to be passed to add experiences
         """
-        steps = self.get_step
+        self.steps = self.get_step
         curr_brain_info = all_brain_info[self.brain_name]
         if len(curr_brain_info.agents) == 0:
             return [], [], [], None
         feed_dict = {}
-        run_list = [self.main.prob, self.main.predictions, self.main.chosen_action, self.main.epsilon, self.main.learning_rate]
+        run_list = [self.main.predictions, self.main.chosen_action, self.main.epsilon]
+        if not self.trainer_parameters['frozen']:
+            run_list += [self.main.learning_rate]
         if self.use_observations:
             for i, _ in enumerate(curr_brain_info.visual_observations):
                 feed_dict[self.main.visual_in[i]] = curr_brain_info.visual_observations[i]
@@ -196,17 +204,17 @@ class DQNTrainer(Trainer):
         if (self.is_training and self.brain.vector_observation_space_type == "continuous" and
                 self.use_states and self.trainer_parameters['normalize']):
             new_mean, new_variance = self.running_average(
-                curr_brain_info.vector_observations, steps, self.main.running_mean, self.main.running_variance)
+                curr_brain_info.vector_observations, self.steps, self.main.running_mean, self.main.running_variance)
             feed_dict[self.main.new_mean] = new_mean
             feed_dict[self.main.new_variance] = new_variance
             run_list = run_list + [self.main.update_mean, self.main.update_variance]
 
         values = self.sess.run(run_list, feed_dict=feed_dict)
         run_out = dict(zip(run_list, values))
-        prob = run_out[self.main.prob]
         self.stats['value_estimate'].append(run_out[self.main.predictions].mean())
         self.stats['epsilon'].append(run_out[self.main.epsilon])
-        self.stats['learning_rate'].append(run_out[self.main.learning_rate])
+        if not self.trainer_parameters['frozen']:
+            self.stats['learning_rate'].append(run_out[self.main.learning_rate])
         if self.use_recurrent:
             return (run_out[self.main.chosen_action],
                     run_out[self.main.memory_out],
@@ -218,15 +226,14 @@ class DQNTrainer(Trainer):
                     [str(v) for v in run_out[self.main.predictions]],
                     run_out)
 
-
     def add_experiences(self, curr_all_info: AllBrainInfo, next_all_info: AllBrainInfo, take_action_outputs):
+
         """
         Adds experiences to each agent's experience history.
         :param curr_all_info: Dictionary of all current brains and corresponding BrainInfo.
         :param next_all_info: Dictionary of all current brains and corresponding BrainInfo.
         :param take_action_outputs: The outputs of the take action method.
         """
-
         curr_info = curr_all_info[self.brain_name]
         next_info = next_all_info[self.brain_name]
 
@@ -240,63 +247,83 @@ class DQNTrainer(Trainer):
             if len(curr_info.agents) > 0:
                 self.create_history(curr_info)
 
-        for (agent_id, history) in self.history_dict.items():
-            for agent_id in next_info.agents:
-                stored_info = self.training_buffer[agent_id].last_brain_info
-                stored_take_action_outputs = self.training_buffer[agent_id].last_take_action_outputs
-                if stored_info is None:
-                    continue
-                else:
-                    idx = stored_info.agents.index(agent_id)
-                    next_idx = next_info.agents.index(agent_id)
-                    if not stored_info.local_done[idx]:
-                        if self.use_observations:
-                            for i, _ in enumerate(info.observations):
-                                self.history_dict[agent_id]['observations%d' % i].append([stored_info.visual_observations[i][idx]])
-                                self.history_dict[agent_id]['next_observations%d' % i].append([next_info.visual_observations[i][next_idx]])
-                        if self.use_states:
-                            self.history_dict[agent_id]['states'].append(stored_info.vector_observations[idx])
-                            self.history_dict[agent_id]['next_states'].append(next_info.vector_observations[next_idx])
-                        actions = stored_take_action_outputs[self.main.chosen_action]
-                        self.history_dict[agent_id]['actions'].append(actions[idx])
-                        self.history_dict[agent_id]['rewards'].append(next_info.rewards[next_idx])
-                        self.history_dict[agent_id]['done'].append(next_info.local_done[next_idx])
-                        if agent_id not in self.cumulative_rewards:
-                            self.cumulative_rewards[agent_id] = 0
-                        self.cumulative_rewards[agent_id] += next_info.rewards[next_idx]
-                        if agent_id not in self.episode_steps:
-                            self.episode_steps[agent_id] = 0
-                        self.episode_steps[agent_id] += 1
+        if not self.trainer_parameters['frozen']:
+            if len(curr_info.agents) > 0:
+                for agent_id in next_info.agents:
+                    stored_info = self.training_buffer[agent_id].last_brain_info
+                    stored_take_action_outputs = self.training_buffer[agent_id].last_take_action_outputs
+                    if stored_info is None:
+                        continue
+                    else:
+                        idx = stored_info.agents.index(agent_id)
+                        next_idx = next_info.agents.index(agent_id)
+                        if not stored_info.local_done[idx]:
+                            if self.use_observations:
+                                for i, _ in enumerate(info.observations):
+                                    self.history_dict[agent_id]['observations%d' % i].append([stored_info.visual_observations[i][idx]])
+                                    self.history_dict[agent_id]['next_observations%d' % i].append([next_info.visual_observations[i][next_idx]])
+                            if self.use_states:
+                                self.history_dict[agent_id]['states'].append(stored_info.vector_observations[idx])
+                                self.history_dict[agent_id]['next_states'].append(next_info.vector_observations[next_idx])
+                            actions = stored_take_action_outputs[self.main.chosen_action]
+                            self.history_dict[agent_id]['actions'].append(actions[idx])
+                            self.history_dict[agent_id]['rewards'].append(next_info.rewards[next_idx])
+                            self.history_dict[agent_id]['done'].append(next_info.local_done[next_idx])
+                            if agent_id not in self.cumulative_rewards:
+                                self.cumulative_rewards[agent_id] = 0
+                            self.cumulative_rewards[agent_id] += next_info.rewards[next_idx]
+                            if agent_id not in self.episode_steps:
+                                self.episode_steps[agent_id] = 0
+                            self.episode_steps[agent_id] += 1
+                            #print("local buffer " + str(len(self.training_buffer[agent_id]['actions'])))
+
+        else:
+            if len(curr_info.agents) > 0:
+                for agent_id in next_info.agents:
+                    stored_info = self.training_buffer[agent_id].last_brain_info
+                    stored_take_action_outputs = self.training_buffer[agent_id].last_take_action_outputs
+                    if stored_info is None:
+                        continue
+                    else:
+                        idx = stored_info.agents.index(agent_id)
+                        next_idx = next_info.agents.index(agent_id)
+                        if not stored_info.local_done[idx]:
+                            actions = stored_take_action_outputs[self.main.chosen_action]
+                            self.history_dict[agent_id]['actions'].append(actions[idx])
+                            if agent_id not in self.cumulative_rewards:
+                                self.cumulative_rewards[agent_id] = 0
+                            self.cumulative_rewards[agent_id] += next_info.rewards[next_idx]
+                            if agent_id not in self.episode_steps:
+                                self.episode_steps[agent_id] = 0
+                            self.episode_steps[agent_id] += 1
+
 
     def process_experiences(self, all_info: AllBrainInfo):
         """
         Add description
         """
-        info = all_info[self.brain_name]
-        for l in range(len(info.agents)):
-            agent_id = info.agents[l]
-            if info.local_done[l] and len(self.history_dict[agent_id]['actions']) > 0:
-                history = self.history_dict[agent_id]
-                self.training_buffer.append_replay_memory(local_buffer=history, replay_memory_size=self.trainer_parameters['replay_memory_size'])
-                self.empty_local_history(agent_id)
-                if info.local_done[l]:
+        if not self.trainer_parameters['frozen']:
+            info = all_info[self.brain_name]
+            for l in range(len(info.agents)):
+                agent_id = info.agents[l]
+                if info.local_done[l] and len(self.history_dict[agent_id]['actions']) > 0:
+                    history = self.history_dict[agent_id]
+                    self.training_buffer.append_replay_memory(local_buffer=history, replay_memory_size=self.trainer_parameters['replay_memory_size'])
+                    self.empty_local_history(agent_id)
+                    if info.local_done[l]:
+                        self.stats['cumulative_reward'].append(self.cumulative_rewards[agent_id])
+                        self.stats['episode_length'].append(self.episode_steps[agent_id])
+                        self.cumulative_rewards[agent_id] = 0
+                        self.episode_steps[agent_id] = 0
+        else:
+            info = all_info[self.brain_name]
+            for l in range(len(info.agents)):
+                agent_id = info.agents[l]
+                if info.local_done[l] and len(self.history_dict[agent_id]['actions']) > 0:
                     self.stats['cumulative_reward'].append(self.cumulative_rewards[agent_id])
                     self.stats['episode_length'].append(self.episode_steps[agent_id])
                     self.cumulative_rewards[agent_id] = 0
                     self.episode_steps[agent_id] = 0
-
-    def create_history(self, agent_info):
-        """
-        Clears all agent histories and resets reward and episode length counters.
-        :param agent_info: a BrainInfo object.
-        :return: an emptied history dictionary.
-        """
-        self.history_dict = {}
-        for agent_id in agent_info.agents:
-            self.history_dict[agent_id] = {}
-            self.empty_local_history(agent_id)
-            for i, _ in enumerate(agent_info.visual_observations):
-                self.history_dict[agent_id]['observations%d' % i] = []
 
     def empty_local_history(self, agent_id):
         """
@@ -310,6 +337,20 @@ class DQNTrainer(Trainer):
             self.history_dict[agent_id]['observations%d' % i] = []
         for i, _ in enumerate(key for key in self.history_dict[agent_id].keys() if key.startswith('next_observations')):
             self.history_dict[agent_id]['next_observations%d' % i] = []
+
+    def create_history(self, agent_info):
+        """
+        Clears all agent histories and resets reward and episode length counters.
+        :param agent_info: a BrainInfo object.
+        :return: an emptied history dictionary.
+        """
+        self.history_dict = {}
+        for agent_id in agent_info.agents:
+            self.history_dict[agent_id] = {}
+            self.empty_local_history(agent_id)
+            #print(self.history_dict[agent_id])
+            for i, _ in enumerate(agent_info.visual_observations):
+                self.history_dict[agent_id]['observations%d' % i] = []
 
     def end_episode(self):
         """
@@ -327,9 +368,10 @@ class DQNTrainer(Trainer):
         Returns whether or not the trainer has enough elements to run update model
         :return: A boolean corresponding to whether or not update_model() can be run
         """
-        return len(self.training_buffer.update_buffer['actions']) > \
-               int(self.trainer_parameters['pre_train_steps']) and \
-               self.get_step % int(self.trainer_parameters['update_freq']) == 0
+        return (len(self.training_buffer.update_buffer['actions']) > \
+                int(self.trainer_parameters['pre_train_steps']) or \
+                self.trainer_parameters['frozen']) and \
+                self.steps % int(self.trainer_parameters['update_freq']) == 0
 
     def sample(self, batch_size):
         """
@@ -342,7 +384,6 @@ class DQNTrainer(Trainer):
         for key in _buffer.keys():
             self.update_batch[key] = []
             if len(_buffer[key]) > batch_size:
-            #self.update_batch = np.array(_buffer[key])[idx]
                 for x in idx:
                     self.update_batch[key].append( _buffer[key][x])
 
@@ -350,66 +391,70 @@ class DQNTrainer(Trainer):
         """
         Uses training_buffer to update model.
         """
-        self.sample(self.trainer_parameters['batch_size'])
-        feed_dict1 = {}
-        feed_dict2 = {}
-        feed_dict3 = {}
+        if not self.trainer_parameters['frozen']:
+            self.sample(self.trainer_parameters['batch_size'])
+            feed_dict1 = {}
+            feed_dict2 = {}
+            feed_dict3 = {}
 
-        if self.use_states:
-            if self.brain.vector_observation_space_type == "continuous":
-                feed_dict1[self.main.vector_in] = self.update_batch['next_states']#.reshape(
-                    #[-1, self.brain.vector_observation_space_size * self.brain.num_stacked_vector_observations])
-                feed_dict2[self.target.vector_in] = self.update_batch['next_states']#.reshape(
-                    #[-1, self.brain.vector_observation_space_size * self.brain.num_stacked_vector_observations])
-                feed_dict3[self.main.vector_in] = self.update_batch['states']#.reshape(
-                    #[-1, self.brain.vector_observation_space_size * self.brain.num_stacked_vector_observations])
-            else:
-                feed_dict1[self.main.vector_in] = self.update_batch['next_states'].reshape(
-                    [-1, self.brain.num_stacked_vector_observations])
-                feed_dict2[self.target.vector_in] = self.update_batch['next_states'].reshape(
-                    [-1, self.brain.num_stacked_vector_observations])
-                feed_dict3[self.main.vector_in] = self.update_batch['states'].reshape(
-                    [-1, self.brain.num_stacked_vector_observations])
-        if self.use_observations:
-            for i, _ in enumerate(self.main.visual_in):
-                _obs = np.array(self.update_batch['next_observations%d' % i])
-                (_batch, _seq, _w, _h, _c) = _obs.shape
-                feed_dict1[self.main.visual_in[i]] = _obs.reshape([-1, _w, _h, _c])
-                feed_dict2[self.target.visual_in[i]] = _obs.reshape([-1, _w, _h, _c])
-                _obs = np.array(self.update_batch['observations%d' % i])
-                (_batch, _seq, _w, _h, _c) = _obs.shape
-                feed_dict3[self.main.visual_in[i]] = _obs.reshape([-1, _w, _h, _c])
+            if self.use_states:
+                if self.brain.vector_observation_space_type == "continuous":
+                    feed_dict1[self.main.vector_in] = self.update_batch['next_states']#.reshape(
+                        #[-1, self.brain.vector_observation_space_size * self.brain.num_stacked_vector_observations])
+                    feed_dict2[self.target.vector_in] = self.update_batch['next_states']#.reshape(
+                        #[-1, self.brain.vector_observation_space_size * self.brain.num_stacked_vector_observations])
+                    feed_dict3[self.main.vector_in] = self.update_batch['states']#.reshape(
+                        #[-1, self.brain.vector_observation_space_size * self.brain.num_stacked_vector_observations])
+                else:
+                    feed_dict1[self.main.vector_in] = self.update_batch['next_states'].reshape([-1, self.brain.num_stacked_vector_observations])
+                    feed_dict2[self.target.vector_in] = self.update_batch['next_states'].reshape([-1, self.brain.num_stacked_vector_observations])
+                    feed_dict3[self.main.vector_in] = self.update_batch['states'].reshape([-1, self.brain.num_stacked_vector_observations])
+            if self.use_observations:
+                for i, _ in enumerate(self.main.visual_in):
+                    _obs = self.update_batch['next_observations%d' % i]
+                    (_batch, _seq, _w, _h, _c) = _obs.shape
+                    feed_dict1[self.main.visual_in[i]] = _obs.reshape([-1, _w, _h, _c])
+                    feed_dict2[self.target.visual_in[i]] = _obs.reshape([-1, _w, _h, _c])
+                    _obs = self.update_batch['observations%d' % i]
+                    (_batch, _seq, _w, _h, _c) = _obs.shape
+                    feed_dict3[self.main.visual_in[i]] = _obs.reshape([-1, _w, _h, _c])
 
-        # Find best action for each state according to Q1 (main model)
-        Q1_actions = self.sess.run(self.main.output, feed_dict1)
-        # Double Q-learning:
-        feed_dict2[self.target.actions] = Q1_actions[:,0]
-        # Find Q2 (target model) value of best action according to Q1
-        Q2_values = self.sess.run(self.target.action_value, feed_dict2)
-        inverse_done = np.invert(self.update_batch['done'])
-        targets = self.update_batch['rewards'] + self.trainer_parameters['gamma']*Q2_values*inverse_done
-        feed_dict3[self.main.targets] = targets
-        feed_dict3[self.main.actions] = np.array(self.update_batch['actions'])[:,0]
-        # Update main model using the calculated targets
-        self.sess.run(self.main.update_batch, feed_dict= feed_dict3)
-        # Update target model toward main model
-        for op in self.op_holder:
-            self.sess.run(op)
+            # Find best action for each state according to Q1 (main model)
+            Q1_actions = self.sess.run(self.main.output, feed_dict1)
+            # Double Q-learning:
+            feed_dict2[self.target.actions] = Q1_actions[:,0]
+            # Find Q2 (target model) value of best action according to Q1
+            Q2_values = self.sess.run(self.target.action_value, feed_dict2)
+            inverse_done = np.invert(self.update_batch['done'])
+            targets = self.update_batch['rewards'] + self.trainer_parameters['gamma']*Q2_values*inverse_done
+            feed_dict3[self.main.targets] = targets
+            feed_dict3[self.main.actions] = np.array(self.update_batch['actions'])[:,0]
+            # Update main model using the calculated targets
+            self.sess.run(self.main.update_batch, feed_dict= feed_dict3)
+            # Update target model toward main model
+            for op in self.op_holder:
+                self.sess.run(op)
+            # Empty replay memory
+            if self.steps % self.trainer_parameters['update_frozen_freq'] == 0 and self.steps != 0:
+                self.training_buffer.reset_replay_memory()
+                #self.sess.run(self.main.increment_updates)
+        else:
+            if self.steps % self.trainer_parameters['update_frozen_freq'] == 0 and self.steps != 0:
+                for update in self.update_frozen_brain:
+                    self.sess.run(update)
 
     def write_summary(self, lesson_number):
         """
         Saves training statistics to Tensorboard.
         :param lesson_number: The lesson the trainer is at.
         """
-        if (self.get_step % self.trainer_parameters['summary_freq'] == 0 and self.get_step != 0 and
-                self.is_training and self.get_step <= self.get_max_steps):
+        if (self.steps % self.trainer_parameters['summary_freq'] == 0 and self.steps != 0 and
+                self.is_training and self.steps <= self.get_max_steps):
             print(len(self.training_buffer.update_buffer['actions']))
-            steps = self.get_step
             if len(self.stats['cumulative_reward']) > 0:
                 mean_reward = np.mean(self.stats['cumulative_reward'])
                 logger.info(" {}: Step: {}. Mean Reward: {:0.3f}. Std of Reward: {:0.3f}."
-                            .format(self.brain_name, steps, mean_reward, np.std(self.stats['cumulative_reward'])))
-            #print(len(self.stats['cumulative_reward']))
+                            .format(self.brain_name, self.steps, mean_reward, np.std(self.stats['cumulative_reward'])))
             summary = tf.Summary()
             for key in self.stats:
                 if len(self.stats[key]) > 0:
@@ -417,7 +462,7 @@ class DQNTrainer(Trainer):
                     summary.value.add(tag='Info/{}'.format(key), simple_value=stat_mean)
                     self.stats[key] = []
             summary.value.add(tag='Info/Lesson', simple_value=lesson_number)
-            self.summary_writer.add_summary(summary, steps)
+            self.summary_writer.add_summary(summary, self.steps)
             self.summary_writer.flush()
 
 
@@ -429,6 +474,12 @@ class DQNTrainer(Trainer):
                 tfVars[idx+total_vars//2].assign((
                 var.value()*self.trainer_parameters['tau'])
                 + ((1-self.trainer_parameters['tau'])*tfVars[idx+total_vars//2].value())))
+
+    def update_frozen_brain_graph(self, frozen_brain_vars, free_brain_vars):
+        self.update_frozen_brain = []
+        for idx,var in enumerate(free_brain_vars):
+            self.update_frozen_brain.append(
+                frozen_brain_vars[idx].assign(var.value()))
 
 def discount_rewards(r, gamma=0.99, value_next=0.0):
     """
